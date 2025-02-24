@@ -1,4 +1,4 @@
-```markdown
+
 # WebWar - Auditoría Web Avanzada
 
 WebWar es una herramienta de auditoría de vulnerabilidades en aplicaciones web, desarrollada en Python. Permite realizar escaneos avanzados de puertos, análisis SSL/TLS, pruebas de inyección (SQLi, XSS, SSTI, LFI, inyección de comandos), fuerza bruta de directorios y enumeración de subdominios, entre otras funcionalidades. Además, si no se encuentran las wordlists necesarias en el sistema, el script las descarga automáticamente.
