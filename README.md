@@ -102,4 +102,4 @@ Si tienes dudas o sugerencias, abre un [issue](https://github.com/tu_usuario/web
 ---
 
 ¡Utiliza WebWar de forma responsable y feliz auditoría!
-```
+Att: By Flox & P4rzival
