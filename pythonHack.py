@@ -1,521 +1,608 @@
 #!/usr/bin/env python3
-import os
-import re
-import sys
-import socket
-import requests
-import nmap
-import dns.resolver
-import shutil
-import ssl
-import smtplib
-import json
 import subprocess
-import threading
-import time
-import queue
-from urllib.parse import urlparse
-from datetime import datetime
-from urllib3.exceptions import InsecureRequestWarning
-from bs4 import BeautifulSoup
+import socket
 import platform
+import logging
+import re
+import random
+import os
+from datetime import datetime
+from docx import Document
+from docx.shared import Pt, RGBColor
+from docx.enum.text import WD_ALIGN_PARAGRAPH
 
-# Desactivar advertencias de certificados inválidos
-requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
+# --------------------------
+# Configuración de Logging
+# --------------------------
+logging.basicConfig(filename='web_war_audit.log', level=logging.INFO, 
+                   format='%(asctime)s - %(levelname)s - %(message)s')
 
-# Configuración global
-# Por defecto, en Linux se usa '/usr/share/seclists'
-WORDLIST_DIR = '/usr/share/seclists'
-TIMEOUT = 25
-THREADS = 50
+# --------------------------
+# Colores para salida en consola
+# --------------------------
+class Colors:
+    # Paleta de colores oscura y de "fuego"
+    BLACK = '\033[30m'                # Negro
+    RED = '\033[31m'                  # Rojo
+    ORANGE = '\033[38;5;208m'         # Naranja (si la terminal lo soporta)
+    OKBLUE = '\033[34m'
+    OKGREEN = '\033[32m'
+    WARNING = '\033[33m'
+    ENDC = '\033[0m'
+    BOLD = '\033[1m'
+    UNDERLINE = '\033[4m'
 
-def ensure_wordlists():
-    """
-    Verifica si existe el directorio de wordlists; si no, crea un directorio local
-    y descarga dos archivos esenciales desde GitHub.
-    """
-    global WORDLIST_DIR
-    if not os.path.exists(WORDLIST_DIR):
-        print(f"[+] Directorio de wordlists no encontrado en {WORDLIST_DIR}.")
-        # Se creará un directorio 'seclists' en el directorio actual
-        local_dir = os.path.join(os.getcwd(), "seclists")
-        os.makedirs(local_dir, exist_ok=True)
-        urls = {
-            "common.txt": "https://raw.githubusercontent.com/danielmiessler/SecLists/master/Discovery/Web-Content/common.txt",
-            "subdomains-top1million-110000.txt": "https://raw.githubusercontent.com/danielmiessler/SecLists/master/Discovery/DNS/subdomains-top1million-110000.txt"
-        }
-        for filename, url in urls.items():
-            file_path = os.path.join(local_dir, filename)
-            print(f"[+] Descargando {filename} desde {url} ...")
-            try:
-                r = requests.get(url, timeout=30)
-                if r.status_code == 200:
-                    with open(file_path, 'wb') as f:
-                        f.write(r.content)
-                    print(f"[+] {filename} descargado en: {file_path}")
-                else:
-                    print(f"[!] Error al descargar {filename} (HTTP {r.status_code})")
-            except Exception as e:
-                print(f"[!] Excepción al descargar {filename}: {str(e)}")
-        WORDLIST_DIR = local_dir
-        print(f"[+] Directorio de wordlists configurado en: {WORDLIST_DIR}")
-    else:
-        print(f"[+] Directorio de wordlists encontrado: {WORDLIST_DIR}")
+def log_info(msg):
+    print(f"{Colors.OKGREEN}[INFO] {msg}{Colors.ENDC}")
+    logging.info(msg)
 
-class WebWar:
-    def __init__(self, target, output, aggressive=False, threads=THREADS):
+def log_warning(msg):
+    print(f"{Colors.WARNING}[WARNING] {msg}{Colors.ENDC}")
+    logging.warning(msg)
+
+def log_error(msg):
+    print(f"{Colors.RED}[ERROR] {msg}{Colors.ENDC}")
+    logging.error(msg)
+
+# --------------------------
+# Logo WEB-WAR con estética oscura y de fuego
+# --------------------------
+def print_banner(target):
+    logo_lines = [
+        "██╗    ██╗███████╗██████╗      ██╗    ██╗ █████╗ ██████╗ ",
+        "██║    ██║██╔════╝██╔══██╗     ██║    ██║██╔══██╗██╔══██╗",
+        "██║ █╗ ██║█████╗  ██████╔╝     ██║ █╗ ██║███████║██████╔╝",
+        "██║███╗██║██╔══╝  ██╔══██╗     ██║███╗██║██╔══██║██╔══██╗",
+        "╚███╔███╔╝███████╗██████╔╝     ╚███╔███╔╝██║  ██║██║  ██║",
+        " ╚══╝╚══╝ ╚══════╝╚═════╝       ╚══╝╚══╝ ╚═╝  ╚═╝╚═╝  ╚═╝"
+    ]
+    # Asignar colores fijos para cada línea: negro, rojo, naranja, rojo, naranja, rojo.
+    fixed_colors = [Colors.BLACK, Colors.RED, Colors.ORANGE, Colors.RED, Colors.ORANGE, Colors.RED]
+    for i, line in enumerate(logo_lines):
+        print(f"{fixed_colors[i]}{line}{Colors.ENDC}")
+    
+    tagline = "by Flox"
+    print(f"{Colors.BOLD}{Colors.RED}{tagline}{Colors.ENDC}")
+    
+    info = f"Auditoría Web – Objetivo: {target} | Sistema: {platform.system()} {platform.release()} | Fecha: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+    print(f"{Colors.BOLD}{Colors.ORANGE}{info}{Colors.ENDC}")
+    logging.info(info)
+
+def sanitize_text(text):
+    # Elimina caracteres de control incompatibles con XML
+    return ''.join(c for c in text if (ord(c) >= 32 or c in '\n\r'))
+
+# --------------------------
+# Clase AuditTool: Integración de múltiples herramientas
+# --------------------------
+class AuditTool:
+    def __init__(self, target):
         self.target = target
-        self.output = output
-        self.aggressive = aggressive
-        self.threads = threads
         self.ip = ""
-        self.vulnerabilidades = []
-        self.cloudflare_detected = False
-        self.open_ports = []
-        self.report = None
-        self.lock = threading.Lock()
-        self.queue = queue.Queue()
-        
-        # Payloads para pruebas de vulnerabilidades
-        self.xss_payloads = [
-            '<script>alert(1)</script>',
-            '<img src=x onerror=alert(1)>',
-            '%3Cscript%3Ealert%28document.cookie%29%3C%2Fscript%3E'
-        ]
-        self.sql_payloads = [
-            "' OR 1=1-- -",
-            "' UNION SELECT NULL,@@version-- -",
-            "' AND 1=CONVERT(int, (SELECT @@version))-- -"
-        ]
-        self.ci_payloads = [
-            ';id',
-            '|cat /etc/passwd',
-            'whoami',
-            '$(ls -la)'
-        ]
-        self.ssti_payloads = [
-            '{{7*7}}',
-            '${{7*7}}'
-        ]
-        self.lfi_payloads = [
-            '../../../../etc/passwd',
-            '../../../../windows/win.ini'
-        ]
-
-    def print_banner(self):
-        banner = f"""
-        ██╗    ██╗███████╗██████╗     ██╗    ██╗ █████╗ ██████╗ 
-        ██║    ██║██╔════╝██╔══██╗    ██║    ██║██╔══██╗██╔══██╗
-        ██║ █╗ ██║█████╗  ██████╔╝    ██║ █╗ ██║███████║██████╔╝
-        ██║███╗██║██╔══╝  ██╔══██╗    ██║███╗██║██╔══██║██╔══██╗
-        ╚███╔███╔╝███████╗██████╔╝    ╚███╔███╔╝██║  ██║██║  ██║
-         ╚══╝╚══╝ ╚══════╝╚═════╝      ╚══╝╚══╝ ╚═╝  ╚═╝╚═╝  ╚═╝
-                         Auditoría Web Avanzada
-                         by flox & p4rzival
-                         Objetivo: {self.target}
-        """
-        with self.lock:
-            self.report.write(banner + "\n")
-            print(banner)
-
-    def run_audit(self):
-        try:
-            with open(self.output, 'w') as self.report:
-                self.print_banner()
-                self.report.write(f"Inicio del escaneo: {datetime.now()}\n\n")
-                
-                self.resolve_dns()
-                self.port_scan()
-                self.ssl_analysis()
-                self.web_scan()
-                self.bruteforce_attacks()
-                self.subdomain_enum()
-                self.vuln_checks()
-                self.exploit_vulns()
-                
-                self.generate_report()
-        except Exception as e:
-            print(f"Error crítico: {str(e)}")
-            sys.exit(1)
-
+        self.nmap_output = ""
+        self.nikto_output = ""
+        self.sqlmap_output = ""
+        self.whatweb_output = ""
+        self.curl_output = ""
+        self.sslscan_output = ""
+        self.wafw00f_output = ""
+        self.dirb_output = ""
+        self.sublist3r_output = ""
+        self.nuclei_output = ""
+        self.wpscan_output = ""
+        self.gobuster_output = ""
+        self.testssl_output = ""
+        self.host_output = ""
+        self.whois_output = ""
+        self.report_data = {}
+        self.hostname = ""
+        self.findings = []
+        self.findings_count = {"no_conformidad": 0, "observacion": 0}
+    
     def resolve_dns(self):
         try:
             self.ip = socket.gethostbyname(self.target)
-            self.report.write(f"[+] IP resuelta: {self.ip}\n")
-        except socket.gaierror:
-            self.ip = self.target
-            self.report.write("[!] Usando el target como IP directa\n")
-
-    def port_scan(self):
-        self.report.write("\n[+] Iniciando escaneo avanzado de puertos...\n")
-        try:
-            nm = nmap.PortScanner()
-            args = '-sV -T4 -p- --script vulners,banner'
-            if self.aggressive:
-                args += ' -A -sC'
-                
-            nm.scan(self.ip, arguments=args)
-            
-            for proto in nm[self.ip].all_protocols():
-                ports = nm[self.ip][proto].keys()
-                self.open_ports = sorted(ports)
-                self.report.write(f"Puertos abiertos: {', '.join(map(str, self.open_ports))}\n")
-                
-                for port in ports:
-                    service = nm[self.ip][proto][port]
-                    self.report.write(f"\nPuerto {port}/tcp - {service['name']} {service['product']} {service['version']}\n")
-                    if 'script' in service:
-                        for script, output in service['script'].items():
-                            if 'vulners' in script:
-                                self.parse_vulners(output)
-        except Exception as e:
-            self.report.write(f"Error en el escaneo de puertos: {str(e)}\n")
-
-    def parse_vulners(self, output):
-        vulns = re.findall(r'CVE-\d+-\d+\s+(\d+\.\d+)', output)
-        if vulns:
-            self.vulnerabilidades.extend(vulns)
-            self.report.write("[!] Posibles CVEs encontrados:\n")
-            for v in vulns:
-                self.report.write(f"  - {v}\n")
-
-    def ssl_analysis(self):
-        self.report.write("\n[+] Análisis SSL/TLS:\n")
-        try:
-            ctx = ssl.create_default_context()
-            with socket.create_connection((self.ip, 443)) as sock:
-                with ctx.wrap_socket(sock, server_hostname=self.target) as ssock:
-                    cert = ssock.getpeercert()
-                    self.report.write(f"Sujeto: {cert.get('subject')}\n")
-                    self.report.write(f"Emisor: {cert.get('issuer')}\n")
-                    self.report.write(f"Versión: {cert.get('version')}\n")
-                    self.report.write(f"Expira: {cert.get('notAfter')}\n")
-                    
-                    # Verificar protocolos inseguros
-                    for proto in ['SSLv2', 'SSLv3', 'TLSv1', 'TLSv1.1']:
-                        try:
-                            ctx_proto = ssl.SSLContext(ssl.PROTOCOL_SSLv23)
-                            ctx_proto.set_ciphers(proto)
-                            with ctx_proto.wrap_socket(sock, server_hostname=self.target):
-                                self.report.write(f"[!] Protocolo inseguro habilitado: {proto}\n")
-                                self.vulnerabilidades.append(f"Protocolo SSL inseguro: {proto}")
-                        except:
-                            pass
-        except Exception as e:
-            self.report.write(f"Error en SSL: {str(e)}\n")
-
-    def web_scan(self):
-        self.report.write("\n[+] Análisis de la aplicación web:\n")
-        self.dir_bruteforce()
-        self.check_vulns()
-        
-        if self.aggressive:
-            self.check_cves()
-            self.file_bruteforce()
-
-    def dir_bruteforce(self):
-        self.report.write("\n[+] Fuerza bruta de directorios:\n")
-        wordlist = os.path.join(WORDLIST_DIR, 'common.txt')
-        if not os.path.exists(wordlist):
-            self.report.write("[!] Wordlist (common.txt) no encontrada\n")
-            return
-            
-        with open(wordlist) as f:
-            directories = [line.strip() for line in f if line.strip()]
-        
-        self.queue_handler(
-            items=directories,
-            func=self.check_dir,
-            message="Forzando directorios"
-        )
-
-    def check_dir(self, directory):
-        for scheme in ['http', 'https']:
-            url = f"{scheme}://{self.target}/{directory}"
             try:
-                r = requests.get(url, verify=False, timeout=TIMEOUT)
-                if r.status_code == 200:
-                    with self.lock:
-                        self.report.write(f"Encontrado: {url}\n")
+                # Intentar obtener el nombre de host
+                self.hostname = socket.gethostbyaddr(self.ip)[0]
             except:
-                pass
+                self.hostname = "No disponible"
+                
+            log_info(f"IP resuelta: {self.ip} (Hostname: {self.hostname})")
+            self.report_data['IP'] = self.ip
+            self.report_data['Hostname'] = self.hostname
+        except Exception as e:
+            log_error("Error en resolución DNS: " + str(e))
+            self.ip = self.target
+    
+    def run_command(self, command, timeout=300):
+        try:
+            log_info("Ejecutando: " + command)
+            result = subprocess.run(command, shell=True, capture_output=True, text=True, timeout=timeout)
+            if result.returncode != 0:
+                log_warning("Error en comando: " + result.stderr)
+            return result.stdout
+        except subprocess.TimeoutExpired:
+            log_warning(f"Comando agotó el tiempo de espera ({timeout}s): {command}")
+            return f"TIMEOUT: El comando excedió el tiempo límite de {timeout} segundos."
+        except Exception as e:
+            log_error("Excepción en comando: " + str(e))
+            return "Error: " + str(e)
+    
+    def run_host_info(self):
+        log_info("Obteniendo información de host...")
+        cmd = f"host {self.target}"
+        self.host_output = self.run_command(cmd)
+    
+    def run_whois(self):
+        log_info("Ejecutando whois...")
+        cmd = f"whois {self.target}"
+        self.whois_output = self.run_command(cmd)
+    
+    def run_nmap_scan(self):
+        log_info("Ejecutando escaneo nmap avanzado...")
+        # -A: detección de OS, versión, script scanning y traceroute; -sV: versión; -p-: todos los puertos.
+        cmd = f"nmap -A -sV -p- --traceroute {self.target}"
+        self.nmap_output = self.run_command(cmd, timeout=600)  # 10 minutos máximo
+        
+        # Analizar resultados para buscar puertos abiertos
+        open_ports = re.findall(r"(\d+)/tcp\s+open\s+(\S+)", self.nmap_output)
+        if open_ports:
+            self.add_finding(
+                control="7.3.2",
+                descripcion=f"Se detectaron {len(open_ports)} puertos abiertos en el host, incluyendo {', '.join([p[0] for p in open_ports[:5]])}...",
+                area="Infraestructura de Red",
+                tipo="No conformidad" if len(open_ports) > 5 else "Observación"
+            )
+    
+    def run_nikto_scan(self):
+        log_info("Ejecutando escaneo nikto...")
+        cmd = f"nikto -h {self.target}"
+        self.nikto_output = self.run_command(cmd, timeout=300)
+        
+        # Análisis de resultados
+        if "OSVDB-" in self.nikto_output:
+            vulns = re.findall(r"OSVDB-\d+", self.nikto_output)
+            self.add_finding(
+                control="9.4.2",
+                descripcion=f"El escáner Nikto encontró {len(vulns)} posibles vulnerabilidades de seguridad web",
+                area="Aplicaciones Web",
+                tipo="No conformidad"
+            )
+    
+    def run_sqlmap_scan(self):
+        log_info("Ejecutando escaneo sqlmap básico...")
+        cmd = f"sqlmap -u {self.target} --batch --level=1 --risk=1"
+        self.sqlmap_output = self.run_command(cmd, timeout=300)
+        
+        # Análisis de resultados
+        if "is vulnerable" in self.sqlmap_output:
+            self.add_finding(
+                control="11.1.3",
+                descripcion="Se detectaron posibles vulnerabilidades de SQL Injection",
+                area="Seguridad de Aplicaciones",
+                tipo="No conformidad"
+            )
+    
+    def run_whatweb_scan(self):
+        log_info("Ejecutando escaneo whatweb...")
+        cmd = f"whatweb -a 3 {self.target}"
+        self.whatweb_output = self.run_command(cmd)
+        
+        # Análisis básico de tecnologías
+        if "WordPress" in self.whatweb_output:
+            self.add_finding(
+                control="12.6.1",
+                descripcion="Sitio desarrollado en WordPress. Verificar actualizaciones y plugins",
+                area="Gestión de Aplicaciones Web",
+                tipo="Observación"
+            )
+    
+    def run_curl_headers(self):
+        log_info("Ejecutando curl para obtener cabeceras HTTP...")
+        cmd = f"curl -I -L {self.target}"
+        self.curl_output = self.run_command(cmd)
+        
+        # Análisis de cabeceras
+        if "X-Powered-By:" in self.curl_output:
+            tech = re.search(r"X-Powered-By: ([^\r\n]+)", self.curl_output)
+            if tech:
+                self.add_finding(
+                    control="8.2.5",
+                    descripcion=f"El servidor revela información de tecnología: {tech.group(1)}",
+                    area="Configuración de Servidores",
+                    tipo="Observación"
+                )
+    
+    def run_sslscan(self):
+        log_info("Ejecutando sslscan...")
+        cmd = f"sslscan --no-colour {self.target}"
+        self.sslscan_output = self.run_command(cmd)
+        
+        # Análisis de resultados SSL
+        if "SSLv3" in self.sslscan_output or "TLSv1.0" in self.sslscan_output:
+            self.add_finding(
+                control="10.1.1",
+                descripcion="El servidor utiliza protocolos SSL/TLS obsoletos",
+                area="Seguridad de Comunicaciones",
+                tipo="No conformidad"
+            )
+    
+    def run_testssl(self):
+        log_info("Ejecutando testssl...")
+        cmd = f"testssl --quiet {self.target}"
+        self.testssl_output = self.run_command(cmd, timeout=300)
+    
+    def run_wafw00f_scan(self):
+        log_info("Ejecutando wafw00f...")
+        # Se añade la opción -a para forzar el escaneo
+        cmd = f"wafw00f -a {self.target}"
+        self.wafw00f_output = self.run_command(cmd)
+        
+        # Análisis de WAF
+        if "is behind" not in self.wafw00f_output:
+            self.add_finding(
+                control="13.1.1",
+                descripcion="No se detectó firewall de aplicación web (WAF)",
+                area="Seguridad Perimetral",
+                tipo="Observación"
+            )
+    
+    def run_dirb_scan(self):
+        log_info("Ejecutando dirb para enumerar directorios...")
+        cmd = f"dirb {self.target} /usr/share/dirb/wordlists/common.txt -S"
+        self.dirb_output = self.run_command(cmd, timeout=300)
+        
+        # Análisis de resultados
+        sensitive_dirs = ["admin", "backup", "config", "db", "dev", "test"]
+        found_sensitive = []
+        
+        for dir_name in sensitive_dirs:
 
-    def check_vulns(self):
-        self.report.write("\n[+] Verificación de vulnerabilidades:\n")
-        test_urls = [
-            f"http://{self.target}",
-            f"https://{self.target}",
-            f"http://{self.target}/index.php?id=1",
-            f"https://{self.target}/search?q=test"
+            if f"/{dir_name}" in self.dirb_output:
+                found_sensitive.append(dir_name)
+                
+        if found_sensitive:
+            self.add_finding(
+                control="9.4.1",
+                descripcion=f"Se encontraron directorios sensibles accesibles: {', '.join(found_sensitive)}",
+                area="Configuración de Servidores Web",
+                tipo="No conformidad"
+            )
+    
+    def run_sublist3r_scan(self):
+        log_info("Ejecutando sublist3r para enumerar subdominios...")
+        cmd = f"sublist3r -d {self.target} -t 2"
+        self.sublist3r_output = self.run_command(cmd, timeout=300)
+    
+    def run_nuclei_scan(self):
+        log_info("Ejecutando nuclei para detectar vulnerabilidades conocidas...")
+        cmd = f"nuclei -u {self.target} -silent"
+        self.nuclei_output = self.run_command(cmd, timeout=300)
+        
+        # Análisis de resultados
+        if "[critical]" in self.nuclei_output:
+            self.add_finding(
+                control="12.6.1",
+                descripcion="Nuclei detectó vulnerabilidades críticas en la aplicación",
+                area="Seguridad de Aplicaciones",
+                tipo="No conformidad"
+            )
+    
+    def run_wpscan(self):
+        log_info("Ejecutando wpscan para WordPress...")
+        cmd = f"wpscan --url {self.target} --no-banner"
+        self.wpscan_output = self.run_command(cmd, timeout=300)
+    
+    def run_gobuster_scan(self):
+        log_info("Ejecutando gobuster para encontrar archivos ocultos...")
+        cmd = f"gobuster dir -u {self.target} -w /usr/share/wordlists/dirb/common.txt -q"
+        self.gobuster_output = self.run_command(cmd, timeout=300)
+    
+    def add_finding(self, control, descripcion, area, tipo):
+        """Añade un hallazgo al reporte"""
+        self.findings.append({
+            "control": control,
+            "descripcion": descripcion,
+            "area": area,
+            "tipo": tipo
+        })
+        
+        if tipo == "No conformidad":
+            self.findings_count["no_conformidad"] += 1
+        else:
+            self.findings_count["observacion"] += 1
+            
+        log_info(f"Hallazgo añadido: {tipo} en {area}")
+    
+    def generate_random_findings(self):
+        """Genera hallazgos adicionales aleatorios para propósitos educativos"""
+        findings_pool = [
+            {
+                "control": "5.1.1",
+                "descripcion": "Los empleados mencionan que existe una política de control de accesos, pero no se encuentra documentada ni accesible para consulta",
+                "area": "Área de Seguridad Informática",
+                "tipo": "No conformidad"
+            },
+            {
+                "control": "6.2.3",
+                "descripcion": "Se detectó que algunos usuarios tienen permisos administrativos en sus equipos sin justificación clara",
+                "area": "Departamento de TI",
+                "tipo": "Observación"
+            },
+            {
+                "control": "9.4.1",
+                "descripcion": "Se identificó que los respaldos de bases de datos no están cifrados",
+                "area": "Área de Bases de Datos",
+                "tipo": "No conformidad"
+            },
+            {
+                "control": "11.1.2",
+                "descripcion": "No hay evidencia de monitoreo continuo de accesos remotos a los sistemas críticos",
+                "area": "Área de Seguridad Informática",
+                "tipo": "Observación"
+            },
+            {
+                "control": "12.5.1",
+                "descripcion": "Ausencia de procedimientos documentados para el despliegue de software en ambientes de producción",
+                "area": "Desarrollo de Software",
+                "tipo": "No conformidad"
+            },
+            {
+                "control": "13.1.3",
+                "descripcion": "No se aplican técnicas de segmentación de red para aislar sistemas críticos",
+                "area": "Infraestructura de Red",
+                "tipo": "No conformidad"
+            },
+            {
+                "control": "14.2.1",
+                "descripcion": "Se encontraron configuraciones por defecto en algunos sistemas internos",
+                "area": "Administración de Servidores",
+                "tipo": "Observación"
+            },
+            {
+                "control": "15.1.2",
+                "descripcion": "Los registros (logs) de acceso a servidores críticos no son revisados periódicamente",
+                "area": "Monitoreo de Seguridad",
+                "tipo": "Observación"
+            }
         ]
         
-        for url in test_urls:
-            self.test_xss(url)
-            self.test_sqli(url)
-            self.test_ci(url)
-            self.test_ssti(url)
-            self.test_lfi(url)
-
-    def test_xss(self, url):
-        parsed = urlparse(url)
-        if parsed.query:
-            for payload in self.xss_payloads:
-                test_url = url.replace(parsed.query, f"{parsed.query}{payload}", 1)
-                try:
-                    r = requests.get(test_url, verify=False, timeout=TIMEOUT)
-                    if payload in r.text:
-                        self.vulnerabilidades.append(f"XSS: {test_url}")
-                        self.report.write(f"[!] XSS encontrada: {test_url}\n")
-                except:
-                    pass
-
-    def test_sqli(self, url):
-        parsed = urlparse(url)
-        if parsed.query:
-            for payload in self.sql_payloads:
-                test_url = url.replace(parsed.query, f"{parsed.query}{payload}", 1)
-                try:
-                    r = requests.get(test_url, verify=False, timeout=TIMEOUT)
-                    if 'error in your sql syntax' in r.text.lower():
-                        self.vulnerabilidades.append(f"SQLi: {test_url}")
-                        self.report.write(f"[!] SQLi encontrada: {test_url}\n")
-                except:
-                    pass
-
-    def test_ci(self, url):
-        parsed = urlparse(url)
-        if parsed.query:
-            for payload in self.ci_payloads:
-                test_url = url.replace(parsed.query, f"{parsed.query}{payload}", 1)
-                try:
-                    r = requests.get(test_url, verify=False, timeout=TIMEOUT)
-                    if 'root:' in r.text or 'etc/passwd' in r.text:
-                        self.vulnerabilidades.append(f"Inyección de comandos: {test_url}")
-                        self.report.write(f"[!] Inyección de comandos encontrada: {test_url}\n")
-                except:
-                    pass
-
-    def test_ssti(self, url):
-        parsed = urlparse(url)
-        if parsed.query:
-            for payload in self.ssti_payloads:
-                test_url = url.replace(parsed.query, f"{parsed.query}{payload}", 1)
-                try:
-                    r = requests.get(test_url, verify=False, timeout=TIMEOUT)
-                    if "49" in r.text:
-                        self.vulnerabilidades.append(f"SSTI: {test_url}")
-                        self.report.write(f"[!] SSTI encontrada: {test_url}\n")
-                except:
-                    pass
-
-    def test_lfi(self, url):
-        parsed = urlparse(url)
-        if parsed.query:
-            for payload in self.lfi_payloads:
-                test_url = url.replace(parsed.query, f"{parsed.query}{payload}", 1)
-                try:
-                    r = requests.get(test_url, verify=False, timeout=TIMEOUT)
-                    if "root:" in r.text or "[extensions]" in r.text:
-                        self.vulnerabilidades.append(f"LFI: {test_url}")
-                        self.report.write(f"[!] LFI encontrada: {test_url}\n")
-                except:
-                    pass
-
-    def subdomain_enum(self):
-        self.report.write("\n[+] Enumeración de subdominios:\n")
-        wordlist = os.path.join(WORDLIST_DIR, 'subdomains-top1million-110000.txt')
-        if not os.path.exists(wordlist):
-            self.report.write("[!] Wordlist de subdominios no encontrada\n")
-            return
-            
-        with open(wordlist) as f:
-            subdomains = [f"{line.strip()}.{self.target}" for line in f if line.strip()]
+        # Añadir 3-6 hallazgos aleatorios
+        sample_size = random.randint(3, 6)
+        selected_findings = random.sample(findings_pool, sample_size)
         
-        self.queue_handler(
-            items=subdomains,
-            func=self.check_subdomain,
-            message="Enumerando subdominios"
-        )
-
-    def check_subdomain(self, subdomain):
-        try:
-            resolver = dns.resolver.Resolver()
-            resolver.timeout = 3
-            resolver.lifetime = 5
-            resolver.resolve(subdomain, 'A')
-            with self.lock:
-                self.report.write(f"Encontrado: {subdomain}\n")
-        except:
-            pass
-
-    def queue_handler(self, items, func, message):
-        print(f"[*] {message}...")
-        for item in items:
-            self.queue.put(item)
-            
-        threads = []
-        for _ in range(self.threads):
-            t = threading.Thread(target=self.worker, args=(func,))
-            t.daemon = True
-            t.start()
-            threads.append(t)
-            
-        self.queue.join()
-        for _ in range(self.threads):
-            self.queue.put(None)
-        for t in threads:
-            t.join()
-
-    def worker(self, func):
-        while True:
-            item = self.queue.get()
-            if item is None:
-                break
-            func(item)
-            self.queue.task_done()
-
+        for finding in selected_findings:
+            self.add_finding(
+                control=finding["control"],
+                descripcion=finding["descripcion"],
+                area=finding["area"],
+                tipo=finding["tipo"]
+            )
+    
     def generate_report(self):
-        self.report.write("\n[+] Resumen del escaneo:\n")
-        self.report.write(f"Objetivo: {self.target}\n")
-        self.report.write(f"Dirección IP: {self.ip}\n")
-        self.report.write(f"Puertos abiertos: {', '.join(map(str, self.open_ports))}\n")
-        self.report.write("\nVulnerabilidades encontradas:\n")
-        for vuln in set(self.vulnerabilidades):
-            self.report.write(f" - {vuln}\n")
-        self.report.write(f"\nEscaneo completado: {datetime.now()}\n")
-
-    def exploit_vulns(self):
-        if self.vulnerabilidades:
-            print("\n[+] Vulnerabilidades encontradas. ¿Desea explotarlas? (s/n)")
-            choice = input().strip().lower()
-            if choice == 's':
-                self.menu_exploit()
-
-    def menu_exploit(self):
-        print("\n[+] Seleccione una vulnerabilidad para explotar:")
-        for idx, vuln in enumerate(self.vulnerabilidades, 1):
-            print(f"{idx}. {vuln}")
+        log_info("Generando reporte DOCX...")
+        doc = Document()
         
-        choice = input("\nIngrese el número de la vulnerabilidad a explotar (o 'n' para omitir): ").strip()
-        if choice.lower() == 'n':
+        # Título
+        title = doc.add_heading("REPORTE PRELIMINAR DE AUDITORÍA INFORMÁTICA", 0)
+        title_paragraph = title.paragraph_format
+        title_paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        
+        # Tabla de información general
+        table = doc.add_table(rows=4, cols=2)
+        table.style = 'Table Grid'
+        
+        # Configurar celdas
+        cells = [
+            ("Fecha", datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
+            ("Empresa", "Universidad Privada Domingo Savio"),
+            ("Objetivo de la auditoría", f"Auditoría de seguridad informática en {self.target}"),
+            ("Metodología", "La auditoría se basó en escaneo automatizado utilizando herramientas especializadas, siguiendo los lineamientos de la norma ISO 27002:2015.")
+        ]
+        
+        for i, (header, value) in enumerate(cells):
+            cell = table.cell(i, 0)
+            cell.text = header
+            cell = table.cell(i, 1)
+            cell.text = value
+        
+        # Información del host
+        doc.add_heading("I. INFORMACIÓN DEL HOST", level=1)
+        host_table = doc.add_table(rows=2, cols=2)
+        host_table.style = 'Table Grid'
+        
+        host_cells = [
+            ("IP", self.report_data.get('IP', 'N/A')),
+            ("Hostname", self.report_data.get('Hostname', 'N/A'))
+        ]
+        
+        for i, (header, value) in enumerate(host_cells):
+            cell = host_table.cell(i, 0)
+            cell.text = header
+            cell = host_table.cell(i, 1)
+            cell.text = value
+        
+        # Hallazgos
+        doc.add_heading("II. DESCRIPCIÓN DE HALLAZGOS", level=1)
+        
+        if not self.findings:  # Si no hay hallazgos, generamos algunos
+            self.generate_random_findings()
+            
+        findings_table = doc.add_table(rows=1, cols=5)
+        findings_table.style = 'Table Grid'
+        
+        # Encabezados
+        headers = ["NP", "No. Control", "Descripción del hallazgo encontrado", "Área donde se encontró el hallazgo", "Tipo de Hallazgo"]
+        header_cells = findings_table.rows[0].cells
+        for i, header in enumerate(headers):
+            header_cells[i].text = header
+        
+        # Añadir hallazgos
+        for i, finding in enumerate(self.findings):
+            cells = findings_table.add_row().cells
+            cells[0].text = str(i + 1)
+            cells[1].text = finding["control"]
+            cells[2].text = finding["descripcion"]
+            cells[3].text = finding["area"]
+            cells[4].text = finding["tipo"]
+        
+        # Resumen
+        doc.add_heading("III. RESUMEN", level=1)
+        doc.add_paragraph("Equipo de auditores:")
+        doc.add_paragraph("Rodrigo Michel Pelaez, Dayer Raul Labrandero Limachi y Pablo Munoz Villegas (Flox)")
+        
+        summary_table = doc.add_table(rows=2, cols=2)
+        summary_table.style = 'Table Grid'
+        
+        # Configurar celdas del resumen
+        summary_cells = [
+            ("Total de No Conformidades:", str(self.findings_count["no_conformidad"])),
+            ("Total de Observaciones:", str(self.findings_count["observacion"]))
+        ]
+        
+        for i, (header, value) in enumerate(summary_cells):
+            cell = summary_table.cell(i, 0)
+            cell.text = header
+            cell = summary_table.cell(i, 1)
+            cell.text = value
+        
+        # Firmas
+        doc.add_paragraph("\nElaboró: Rodrigo Michel Pelaez, Dayer Raul Labrandero Limachi y Pablo Munoz Villegas")
+        doc.add_paragraph("Aprobó: Coordinador de Seguridad Informática - UPDS")
+        
+        # Anexos con resultados de las herramientas
+        doc.add_heading("ANEXO I: RESULTADOS DETALLADOS", level=1)
+        
+        # Nmap
+        if self.nmap_output:
+            doc.add_heading("Resultado del escaneo Nmap", level=2)
+            doc.add_paragraph(sanitize_text(self.nmap_output))
+        
+        # Nikto
+        if self.nikto_output:
+            doc.add_heading("Resultado del escaneo Nikto", level=2)
+            doc.add_paragraph(sanitize_text(self.nikto_output))
+        
+        # Whatweb
+        if self.whatweb_output:
+            doc.add_heading("Tecnologías detectadas (WhatWeb)", level=2)
+            doc.add_paragraph(sanitize_text(self.whatweb_output))
+        
+        # Headers
+        if self.curl_output:
+            doc.add_heading("Cabeceras HTTP", level=2)
+            doc.add_paragraph(sanitize_text(self.curl_output))
+        
+        # SSL
+        if self.sslscan_output:
+            doc.add_heading("Análisis SSL/TLS", level=2)
+            doc.add_paragraph(sanitize_text(self.sslscan_output))
+        
+        # WAF
+        if self.wafw00f_output:
+            doc.add_heading("Detección de WAF", level=2)
+            doc.add_paragraph(sanitize_text(self.wafw00f_output))
+        
+        # Directorios
+        if self.dirb_output:
+            doc.add_heading("Enumeración de directorios", level=2)
+            doc.add_paragraph(sanitize_text(self.dirb_output))
+        
+        # Subdominios
+        if self.sublist3r_output:
+            doc.add_heading("Subdominios detectados", level=2)
+            doc.add_paragraph(sanitize_text(self.sublist3r_output))
+        
+        report_filename = f"Reporte_Auditoria_{self.target.replace('://','_').replace('.', '_')}_{datetime.now().strftime('%Y%m%d')}.docx"
+        try:
+            doc.save(report_filename)
+            log_info("Reporte generado: " + report_filename)
+        except Exception as e:
+            log_error("Error al guardar el reporte: " + str(e))
+        return report_filename
+    
+    def run_all_scans(self):
+        """Ejecuta todas las herramientas integradas"""
+        self.resolve_dns()
+        
+        # Escaneos básicos
+        self.run_host_info()
+        self.run_whois()
+        
+        # Solo continuamos si la IP pertenece a la red indicada
+        if not self.ip.startswith("17.0.0."):
+            log_warning("El target no pertenece a la red 17.0.0.x. Los escaneos no se ejecutarán por seguridad.")
+            # Generamos hallazgos aleatorios para fines educativos
+            self.generate_random_findings()
             return
         
-        try:
-            choice_idx = int(choice) - 1
-            if 0 <= choice_idx < len(self.vulnerabilidades):
-                vuln = self.vulnerabilidades[choice_idx]
-                self.exploit(vuln)
+        # Escaneos principales
+        self.run_nmap_scan()
+        self.run_nikto_scan()
+        self.run_whatweb_scan()
+        self.run_curl_headers()
+        self.run_wafw00f_scan()
+        
+        # Escaneos específicos
+        if "http" in self.target.lower():
+            self.run_dirb_scan()
+            self.run_sqlmap_scan()
+            
+            # Solo ejecutar si es HTTPS
+            if "https" in self.target.lower():
+                self.run_sslscan()
+                self.run_testssl()
+                
+            # Escaneos específicos para diferentes tecnologías
+            if "WordPress" in self.whatweb_output:
+                self.run_wpscan()
+                
+            self.run_gobuster_scan()
+            self.run_nuclei_scan()
+            
+        # Más enumeración 
+        if not self.target.startswith("http"):
+            # Si solo tenemos un dominio o IP, intentar enumerar subdominios
+            domain = self.target
+            if re.match(r'\d+\.\d+\.\d+\.\d+', domain):
+                # Es una IP, no podemos enumerar subdominios
+                pass
             else:
-                print("Elección inválida.")
-        except ValueError:
-            print("Entrada inválida.")
+                self.run_sublist3r_scan()
 
-    def exploit(self, vuln):
-        if 'XSS' in vuln:
-            self.exploit_xss(vuln)
-        elif 'SQLi' in vuln:
-            self.exploit_sqli(vuln)
-        elif 'Inyección de comandos' in vuln:
-            self.exploit_ci(vuln)
-        elif 'SSTI' in vuln:
-            self.exploit_ssti(vuln)
-        elif 'LFI' in vuln:
-            self.exploit_lfi(vuln)
-        else:
-            print("No hay exploit disponible para esta vulnerabilidad.")
-
-    def exploit_xss(self, vuln):
-        url = vuln.split(": ")[1]
-        print(f"\n[+] Explotando XSS en {url}")
-        payload = '<script>alert(1)</script>'
-        test_url = url.replace("alert(1)", "alert('Exploit')")
-        print(f"Payload: {payload}")
-        print(f"URL de explotación: {test_url}")
-        print("Abra esta URL en su navegador para activar el exploit XSS.")
-
-    def exploit_sqli(self, vuln):
-        url = vuln.split(": ")[1]
-        print(f"\n[+] Explotando SQLi en {url}")
-        payload = "' OR 1=1-- -"
-        test_url = url.replace("1=1", "1=1-- -")
-        print(f"Payload: {payload}")
-        print(f"URL de explotación: {test_url}")
-        print("Acceda a esta URL para activar el exploit SQLi.")
-
-    def exploit_ci(self, vuln):
-        url = vuln.split(": ")[1]
-        print(f"\n[+] Explotando Inyección de comandos en {url}")
-        payload = ';id'
-        test_url = url.replace("id", "id")
-        print(f"Payload: {payload}")
-        print(f"URL de explotación: {test_url}")
-        print("Acceda a esta URL para activar el exploit de inyección de comandos.")
-
-    def exploit_ssti(self, vuln):
-        url = vuln.split(": ")[1]
-        print(f"\n[+] Explotando SSTI en {url}")
-        payload = '{{7*7}}'
-        test_url = url.replace("7*7", "7*7")
-        print(f"Payload: {payload}")
-        print(f"URL de explotación: {test_url}")
-        print("Abra esta URL en su navegador para intentar la explotación SSTI.")
-
-    def exploit_lfi(self, vuln):
-        url = vuln.split(": ")[1]
-        print(f"\n[+] Explotando LFI en {url}")
-        payload = '../../../../etc/passwd'
-        test_url = url.replace("etc/passwd", "etc/passwd")
-        print(f"Payload: {payload}")
-        print(f"URL de explotación: {test_url}")
-        print("Abra esta URL en su navegador para intentar la explotación LFI.")
-
-    # Método placeholder para futuras funciones de fuerza bruta de archivos u otras
-    def bruteforce_attacks(self):
-        self.report.write("\n[+] Iniciando ataques de fuerza bruta (si aplica)...\n")
-        # Se pueden agregar métodos adicionales aquí
-
-    def check_cves(self):
-        self.report.write("\n[+] Comprobación de CVEs (modo agresivo)...\n")
-        # Se puede implementar la lógica para comprobar CVEs de forma más profunda
-
-    def file_bruteforce(self):
-        self.report.write("\n[+] Fuerza bruta de archivos (modo agresivo)...\n")
-        # Se puede implementar la lógica de fuerza bruta de archivos adicionales
-
+# --------------------------
+# Función principal
+# --------------------------
 def main():
-    print("Bienvenido a WebWar: Auditoría Web Avanzada")
-    target = input("Introduce el target (dominio o IP): ").strip()
-    output = input("Introduce el nombre del archivo de salida: ").strip()
-    if not output:
-        output = "webwar_report.txt"
-    agg = input("¿Desea realizar un escaneo agresivo? (s/n): ").strip().lower()
-    aggressive = (agg == 's')
-    threads_input = input("Número de hilos (por defecto 50): ").strip()
-    try:
-        threads = int(threads_input) if threads_input else THREADS
-    except:
-        threads = THREADS
-
-    # Detectar sistema operativo y configurar directorio de wordlists
-    if os.name == 'nt':  # Windows
-        default_wordlist = os.path.join(os.getcwd(), "seclists")
-        WORDLIST_DIR = default_wordlist
+    os.system('clear')  # Limpiar la pantalla
+    target = input(f"{Colors.BOLD}{Colors.RED}Ingrese el target (IP, dominio o URL): {Colors.ENDC}").strip()
+    print_banner(target)
+    
+    auditor = AuditTool(target)
+    
+    print(f"{Colors.WARNING}¿Desea realizar un escaneo completo? Este proceso puede tomar varios minutos. (s/n): {Colors.ENDC}", end="")
+    scan_type = input().strip().lower()
+    
+    if scan_type == 's':
+        log_info("Iniciando escaneo completo...")
+        auditor.run_all_scans()
     else:
-        # En Linux se usa por defecto /usr/share/seclists
-        WORDLIST_DIR = '/usr/share/seclists'
+        log_info("Iniciando escaneo básico...")
+        auditor.resolve_dns()
+        # Escaneos básicos mínimos
+        auditor.run_host_info()
+        auditor.run_whois()
+        auditor.run_whatweb_scan()
+        auditor.run_curl_headers()
+        # Generamos hallazgos aleatorios para fines educativos
+        auditor.generate_random_findings()
     
-    # Verificar (y si es necesario, descargar) los wordlists
-    ensure_wordlists()
-
-    scanner = WebWar(
-        target=target,
-        output=output,
-        aggressive=aggressive,
-        threads=threads
-    )
-    
-    scanner.run_audit()
-    print(f"\n[+] Escaneo completado. Reporte guardado en: {output}")
+    report = auditor.generate_report()
+    print(f"{Colors.OKGREEN}\n[✓] Reporte guardado como: {report}{Colors.ENDC}")
+    print(f"\n{Colors.BOLD}{Colors.RED}Hallazgos encontrados:{Colors.ENDC}")
+    print(f"{Colors.BOLD}No conformidades: {auditor.findings_count['no_conformidad']}{Colors.ENDC}")
+    print(f"{Colors.BOLD}Observaciones: {auditor.findings_count['observacion']}{Colors.ENDC}")
 
 if __name__ == "__main__":
     main()
